@@ -1,0 +1,42 @@
+{
+    "app_name": "InvoiceXero",
+    "log_level": "INFO",
+    "log_file": "/var/log/invoice-xero-bridge.log",
+    "port": 8088,
+    "approver_email": "",
+    "notification_recipients": [],
+    "logic_app_url": "",
+    "parsing_mode": "hybrid",
+    "graph": {
+        "tenant_id": "",
+        "client_id": "",
+        "client_secret": "",
+        "shared_mailbox": ""
+    },
+    "llm": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key_env": "LLM_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "temperature": 0.0,
+        "max_tokens": 500
+    },
+    "xero": {
+        "client_id": "",
+        "client_secret": "",
+        "tenant_id": "",
+        "default_account_code": "200",
+        "default_tax_type": "NONE"
+    },
+    "pdf_patterns": {
+        "invoice_number": [
+            "\\bREF\\b[.:]?\\s*([A-Z0-9][-A-Z0-9/]+\\d*)"
+        ],
+        "total_amount": [
+            "TOTAL\\s+Inc\\.\\s*\\$([\\d,]+\\.\\d{2})"
+        ],
+        "due_date": [
+            "(?:Due\\s+Date|Payment\\s+Due|Due)[^:]*:\\s*(\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4})"
+        ]
+    }
+}

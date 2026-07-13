@@ -1,0 +1,24 @@
+# Invoice-to-Xero Bridge — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# HTTP server (built-in, no framework dependency)
+# (http.server is part of stdlib)
+
+# Microsoft Graph API (email access)
+msal>=1.24.0
+
+# HTTP requests
+requests>=2.31.0
+
+# PDF parsing
+pdfplumber>=0.10.0
+
+# PDF image extraction (for OCR fallback)
+pdf2image>=1.16.3
+
+# Optional: OCR for scanned invoices
+# pytesseract>=0.3.10
+# Pillow>=10.0.0
+
+# Optional: Xero Python SDK (only if using full SDK features)
+# xero-python>=1.0.0
