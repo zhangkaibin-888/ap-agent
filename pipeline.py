@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sys
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from io import BytesIO
@@ -49,6 +50,28 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(APP_NAME.lower().replace(" ", "-"))
+
+# ── Processed Cache ──
+PROCESSED_CACHE = Path("/var/log/invoice-xero-processed-cache.json")
+
+def _load_processed_cache():
+    try:
+        with open(PROCESSED_CACHE) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+def _save_processed_cache(cache):
+    try:
+        PROCESSED_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PROCESSED_CACHE, "w") as f:
+            json.dump(sorted(cache), f)
+    except Exception as e:
+        log.warning(f"Could not save processed cache: {e}")
+
+def _smart_lookback_hours():
+    """Monday=72h (catch Friday invoices), Tue-Sun=24h."""
+    return 72 if datetime.now().weekday() == 0 else 24
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -86,8 +109,10 @@ class GraphClient:
     def _headers(self):
         return {"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"}
 
-    def fetch_recent_emails(self, hours=24):
-        """Get emails from the last N hours with PDF attachments."""
+    def fetch_recent_emails(self, hours=None):
+        """Get emails from the last N hours with PDF/zip attachments.
+        Defaults to smart lookback (72h Monday, 24h otherwise)."""
+        hours = hours if hours is not None else _smart_lookback_hours()
         since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox}/messages"
         params = {
@@ -127,10 +152,9 @@ class GraphClient:
             att_resp.raise_for_status()
 
             pdfs = []
+            zips = []
             for att in att_resp.json().get("value", []):
                 name = att.get("name", "")
-                if not name.lower().endswith(".pdf"):
-                    continue
                 if "@odata.mediaContentType" in att:
                     dl_url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox}/messages/{msg['id']}/attachments/{att['id']}/$value"
                     dl_resp = requests.get(dl_url, headers=self._headers())
@@ -138,7 +162,21 @@ class GraphClient:
                     content = dl_resp.content
                 else:
                     content = base64.b64decode(att.get("contentBytes", ""))
-                pdfs.append({"name": name, "bytes": content})
+
+                if name.lower().endswith(".pdf"):
+                    pdfs.append({"name": name, "bytes": content})
+                elif name.lower().endswith(".zip"):
+                    zips.append(content)
+
+            # Extract PDFs from ZIP attachments
+            for zdata in zips:
+                try:
+                    with zipfile.ZipFile(BytesIO(zdata)) as zf:
+                        for zname in zf.namelist():
+                            if zname.lower().endswith(".pdf"):
+                                pdfs.append({"name": zname, "bytes": zf.read(zname), "_from_zip": True})
+                except Exception as e:
+                    log.warning(f"    ⚠ Could not extract ZIP: {e}")
 
             if not pdfs:
                 log.info("    No PDFs — skipping")
@@ -676,9 +714,19 @@ class XeroClient:
             return invoices[0] if invoices else None
         return None
 
-    def create_bill(self, contact_id, inv_num, amount, due_date, description, pdf_bytes=None):
+    def create_bill(self, contact_id, inv_num, amount, due_date, description, pdf_bytes=None, account_code=None, customer=None):
         """Create a bill (accounts payable invoice) in Xero.
-        Status: SUBMITTED — awaiting approval, does NOT release payment."""
+        Status: SUBMITTED — awaiting approval, does NOT release payment.
+        Optionally set a customer tracking category per line item."""
+        line_item = {
+            "Description": (description or "Invoice")[:4000],
+            "Quantity": 1.0,
+            "UnitAmount": amount,
+            "AccountCode": account_code or self.account_code,
+            "TaxType": self.tax_type,
+        }
+        if customer:
+            line_item["Tracking"] = [{"Name": "Customer", "Option": customer[:100]}]
         invoice = {
             "Type": "ACCPAY",
             "Contact": {"ContactID": contact_id},
@@ -686,13 +734,7 @@ class XeroClient:
             "Date": datetime.now().strftime("%Y-%m-%d"),
             "DueDate": due_date,
             "Status": "SUBMITTED",
-            "LineItems": [{
-                "Description": (description or "Invoice")[:4000],
-                "Quantity": 1.0,
-                "UnitAmount": amount,
-                "AccountCode": self.account_code,
-                "TaxType": self.tax_type,
-            }],
+            "LineItems": [line_item],
         }
         resp = requests.post(
             f"{self.BASE_URL}/Invoices",
@@ -727,6 +769,33 @@ class XeroClient:
     @staticmethod
     def invoice_url(inv_id):
         return f"https://go.xero.com/AccountsPayable/Edit/{inv_id}"
+
+    def create_bill_with_line_items(self, contact_id, inv_num, due_date, line_items, reference="", pdf_bytes=None):
+        """Create a bill with multiple line items (e.g. hardware invoices with per-item rows).
+        Each line_item dict: {Description, Quantity, UnitAmount, AccountCode, TaxType, [Tracking]}."""
+        invoice = {
+            "Type": "ACCPAY",
+            "Contact": {"ContactID": contact_id},
+            "InvoiceNumber": inv_num,
+            "Date": datetime.now().strftime("%Y-%m-%d"),
+            "DueDate": due_date,
+            "Status": "SUBMITTED",
+            "Reference": reference[:255] if reference else "",
+            "LineItems": line_items,
+        }
+        resp = requests.post(
+            f"{self.BASE_URL}/Invoices",
+            headers=self._headers(),
+            json={"Invoices": [invoice]},
+        )
+        resp.raise_for_status()
+        created = resp.json()["Invoices"][0]
+        inv_id = created["InvoiceID"]
+        log.info(f"  ✓ Xero bill created: {inv_num} (ID: {inv_id}) — SUBMITTED ({len(line_items)} line items)")
+
+        if pdf_bytes:
+            self._attach_pdf(inv_id, pdf_bytes, f"{inv_num}.pdf")
+        return created
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -784,11 +853,17 @@ def process_email(graph, xero, parser, email):
             })
             continue
 
-        # Duplicate check
+        # Duplicate check (local cache first, then Xero)
+        processed_cache = _load_processed_cache()
+        if inv_num in processed_cache:
+            log.info(f"  ⏭ Invoice #{inv_num} already in local cache — skipping (no Xero call)")
+            continue
         existing = xero.find_invoice(inv_num)
         if existing:
             log.info(f"  ⏭ Invoice #{inv_num} already exists in Xero "
                      f"(Status: {existing.get('Status', '?')}) — skipping")
+            processed_cache.add(inv_num)
+            _save_processed_cache(processed_cache)
             continue
 
         # Find or create Xero contact
@@ -809,6 +884,9 @@ def process_email(graph, xero, parser, email):
             "due_date": due_date,
             "url": url,
         })
+        # Save to cache so future lookback runs skip duplicate Xero API calls
+        processed_cache.add(inv_num)
+        _save_processed_cache(processed_cache)
 
     # Mark email as read
     graph.mark_as_read(email["id"])
@@ -828,11 +906,11 @@ def main():
     xero = XeroClient(cfg)
     parser = InvoiceParser(cfg)
 
-    # Fetch emails — prefer unread, fall back to recent
+    # Fetch emails — prefer unread, fall back to smart lookback
     emails = graph.fetch_unread_invoices()
     if not emails:
-        log.info("No unread emails, checking last 24 hours...")
-        emails = graph.fetch_recent_emails(hours=24)
+        log.info("No unread emails, checking recent (smart lookback)...")
+        emails = graph.fetch_recent_emails()
 
     log.info(f"\nProcessing {len(emails)} invoice emails...")
 
